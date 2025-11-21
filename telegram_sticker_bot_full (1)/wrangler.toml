@@ -1,0 +1,6 @@
+name = "telegram-sticker-full"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+# BOT_TOKEN will be stored in Cloudflare → Settings → Environment Variables
