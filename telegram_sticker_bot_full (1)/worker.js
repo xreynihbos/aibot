@@ -3,76 +3,128 @@ export default {
     if (request.method === "POST") {
       try {
         const update = await request.json();
+        console.log("Update received:", JSON.stringify(update));
 
-        if (!update.message) {
-          return new Response("No message", { status: 200 });
+        // ===== Handle text messages =====
+        if (update.message && update.message.text) {
+          const chatId = update.message.chat.id;
+          const prompt = update.message.text;
+
+          // Balas sementara
+          await sendMessage(chatId, "⏳ Prompt diterima ✅", env);
+
+          // Tambah ke queue
+          addToQueue({ chatId, prompt, env });
+
+          // Kirim tombol inline
+          await sendMessage(chatId, `Prompt: <b>${prompt}</b>`, env, generateButtons(prompt));
         }
 
-        const chatId = update.message.chat.id;
+        // ===== Handle callback buttons =====
+        if (update.callback_query) {
+          const [action, prompt] = update.callback_query.data.split("|");
+          const chatId = update.callback_query.message.chat.id;
 
-        // FEATURE 1: If photo → convert to sticker
-        if (update.message.photo) {
-          const fileId =
-            update.message.photo[update.message.photo.length - 1].file_id;
-
-          const getFile = await fetch(
-            `https://api.telegram.org/bot${env.BOT_TOKEN}/getFile?file_id=${fileId}`
-          );
-          const fileJson = await getFile.json();
-          const filePath = fileJson.result.file_path;
-
-          const fileUrl = `https://api.telegram.org/file/bot${env.BOT_TOKEN}/${filePath}`;
-
-          // Convert to WEBP using Cloudflare Image Resizing
-          const webpImage = await fetch(fileUrl, {
-            cf: {
-              image: {
-                format: "webp",
-                quality: 90,
-                width: 512,
-                height: 512
-              }
-            }
-          });
-
-          const stickerBuffer = await webpImage.arrayBuffer();
-          const form = new FormData();
-          form.append("chat_id", chatId);
-          form.append("sticker", new Blob([stickerBuffer], { type: "image/webp" }), "sticker.webp");
-
-          await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendSticker`, {
-            method: "POST",
-            body: form
-          });
-
-          return new Response("Sticker sent", { status: 200 });
+          if (action === "retry") {
+            await sendMessage(chatId, "🔁 Mengulang... masuk antrean lagi.", env);
+            addToQueue({ chatId, prompt, env });
+          }
         }
 
-        // Feature 2: Text response
-        if (update.message.text) {
-          const text = update.message.text;
-
-          await fetch(
-            `https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`,
-            {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                chat_id: chatId,
-                text: "Kirim foto untuk dijadikan stiker 😊"
-              })
-            }
-          );
-        }
-
-        return new Response("OK", { status: 200 });
-      } catch (e) {
-        return new Response(JSON.stringify({ error: e.toString() }), {
-          status: 500
-        });
+        return new Response("OK");
+      } catch (err) {
+        console.error(err);
+        return new Response("Error processing update", { status: 500 });
       }
     }
 
-    return new Response("Bot is running.");
+    return new Response("Worker is running");
   }
 };
+
+// ===== Queue system =====
+const queue = [];
+let isProcessing = false;
+
+function addToQueue(task) {
+  queue.push(task);
+  processQueue();
+}
+
+async function processQueue() {
+  if (isProcessing || queue.length === 0) return;
+
+  isProcessing = true;
+  const task = queue.shift();
+
+  try {
+    const imgArrayBuffer = await generateImage(task.prompt, task.env);
+    await sendPhoto(task.chatId, imgArrayBuffer, `Prompt: ${task.prompt}`, task.env);
+  } catch (err) {
+    console.error(err);
+    await sendMessage(task.chatId, `❌ Gagal generate gambar: ${err.message}`, task.env);
+  }
+
+  isProcessing = false;
+  setTimeout(processQueue, 500);
+}
+
+// ===== Functions =====
+async function sendMessage(chatId, text, env, extra = {}) {
+  return fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, text: text, parse_mode: "HTML", ...extra })
+  });
+}
+
+async function sendPhoto(chatId, arrayBuffer, caption, env) {
+  const formData = new FormData();
+  formData.append("chat_id", chatId);
+  formData.append("caption", caption);
+  formData.append("photo", new Blob([arrayBuffer]), "image.png");
+
+  return fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/sendPhoto`, {
+    method: "POST",
+    body: formData
+  });
+}
+
+// ===== Generate image using router HF (rupeshs/LCM-runwayml-stable-diffusion-v1-5) =====
+async function generateImage(prompt, env) {
+  const res = await fetch("https://router.huggingface.co/v1/models/rupeshs/LCM-runwayml-stable-diffusion-v1-5", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${env.HF_TOKEN}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      inputs: prompt,
+      options: { wait_for_model: true }
+    })
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`HF fetch failed: ${text}`);
+  }
+
+  const json = await res.json();
+
+  if (!json.data || !json.data[0] || !json.data[0].image) {
+    throw new Error("HF response invalid: no image data");
+  }
+
+  const base64 = json.data[0].image;
+  const binary = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+  return binary.buffer;
+}
+
+// ===== Inline button =====
+function generateButtons(prompt) {
+  return {
+    reply_markup: {
+      inline_keyboard: [[{ text: "🔄 Ulangi", callback_data: `retry|${prompt}` }]]
+    }
+  };
+}
